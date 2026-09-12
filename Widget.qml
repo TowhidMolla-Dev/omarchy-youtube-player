@@ -139,7 +139,6 @@ BarWidget {
     bar: root.bar
     slotSize: Style.bar.statusSlot
     text: root.playing ? "󰏤" : "󰗃"
-    fontSize: Style.font.body
     tooltipText: root.active ? root.title : root.words("Reproductor de YouTube", "YouTube Player")
     onPressed: function(mouseButton) {
       if (mouseButton === Qt.MiddleButton) root.run(["action", "pause"])
