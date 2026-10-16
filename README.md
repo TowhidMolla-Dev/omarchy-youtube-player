@@ -2,6 +2,8 @@
 
 A bar-native YouTube player for Omarchy: search public videos, keep audio in the background, and reveal PiP on demand.
 
+> This is a fork of [brm-src/omarchy-youtube-player](https://github.com/brm-src/omarchy-youtube-player) that adds headless audio-only playback, a search queue with next/previous navigation, media-key IPC, and fixes for playback stopping right after it starts.
+
 ![YouTube Player for Omarchy](screenshots/hero.png)
 
 ## Screenshots
@@ -39,7 +41,7 @@ No sudo or pkexec is required.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/brm-src/omarchy-youtube-player.git --enable --yes
+omarchy plugin add https://github.com/TowhidMolla-Dev/omarchy-youtube-player.git --enable --yes
 omarchy restart shell
 ```
 
