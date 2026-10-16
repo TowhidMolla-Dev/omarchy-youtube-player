@@ -28,6 +28,17 @@ The current release is intentionally URL-first and unauthenticated. It saves onl
 
 Direct stream resolution is not a guarantee of ad-free playback. YouTube playback, availability, authentication, and advertising behavior remain controlled by YouTube. When direct playback fails, open the canonical URL in a normal browser.
 
+## What this fork adds
+
+Compared to [upstream](https://github.com/brm-src/omarchy-youtube-player):
+
+- **True headless audio-only mode.** Upstream always opens an `mpv` window and then minimizes it for audio-only. This fork launches `mpv` with `--no-video --vo=null`, so audio-only never creates a window at all. That means no video decoding (lower CPU/GPU), no compositor window, and no focus or workspace churn. Set `OMARCHY_YOUTUBE_AUDIO_ONLY=1` to make it the default, or toggle it per session from the popup.
+- **Playback queue.** Search results become a real playlist with `Previous` / `Next`, a `current / total` counter, and wrap-around at the end.
+- **Media-key controls.** `playPause`, `next`, `previous`, and `stop` IPC methods (upstream only exposes `open` / `close` / `toggle`), so you can bind them in Hyprland.
+- **Playback no longer stops right after it starts.** If you use `save-position-on-quit=yes` (or replay a URL you have played before), upstream's `mpv` resumes the URL at its saved end position and immediately hits EOF. This fork runs its own `mpv` with `--no-resume-playback --save-position-on-quit=no`, so tracks always start from the beginning. The fork's own resume feature is unaffected.
+- **Search fix.** Channel and tab entries are filtered out, fixing the "This video could not be played" error when YouTube returns a non-video result first.
+- **Live progress.** The status watcher stays connected across track changes and stops, so the bar and popup always show the real position and queue.
+
 ## Requirements
 
 - Omarchy with Quickshell plugins
@@ -69,7 +80,7 @@ Omit that environment variable to use the system language.
 - Search for a video, then select a result.
 - In video mode, playback continues in the background in a small PiP window without capturing the mouse or keyboard focus. With `OMARCHY_YOUTUBE_AUDIO_ONLY=1` the player runs headless instead.
 - Press `Escape` or click outside the popup to close it.
-- Use the popup controls for pause, seek, volume, fullscreen, and `Audio only`.
+- Use the popup controls for previous, next, pause, seek, volume, fullscreen, and `Audio only`.
 - `Audio only` plays with no window at all: the player runs headless while audio continues.
 - Use `Show video` to open the PiP window, or `Stop` to end playback.
 
@@ -79,6 +90,10 @@ The direct IPC target is:
 omarchy-shell io.github.brm-src.omarchy-youtube-player open
 omarchy-shell io.github.brm-src.omarchy-youtube-player close
 omarchy-shell io.github.brm-src.omarchy-youtube-player toggle
+omarchy-shell io.github.brm-src.omarchy-youtube-player playPause
+omarchy-shell io.github.brm-src.omarchy-youtube-player next
+omarchy-shell io.github.brm-src.omarchy-youtube-player previous
+omarchy-shell io.github.brm-src.omarchy-youtube-player stop
 ```
 
 ## Remove
