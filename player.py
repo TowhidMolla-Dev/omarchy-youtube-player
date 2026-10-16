@@ -32,7 +32,29 @@ MAX_THUMBNAIL_CHARS = 512
 MAX_TITLE_CHARS = 180
 MAX_CHANNEL_CHARS = 100
 MAX_WORKSPACE_CHARS = 64
-MAX_RESULTS = 8
+MAX_QUEUE_ITEMS = 50
+VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, low), high)
+
+
+# Optional tunables. Defaults preserve the previous behaviour; every value can be
+# overridden from the environment without editing the plugin.
+MAX_RESULTS = _env_int("OMARCHY_YOUTUBE_MAX_RESULTS", 8, 1, 20)
+PLAYER_WIDTH = _env_int("OMARCHY_YOUTUBE_WIDTH", 480, 160, 3840)
+PLAYER_HEIGHT = _env_int("OMARCHY_YOUTUBE_HEIGHT", 270, 90, 2160)
+PLAYER_X = _env_int("OMARCHY_YOUTUBE_X", 24, 0, 20000)
+PLAYER_Y = _env_int("OMARCHY_YOUTUBE_Y", 64, 0, 20000)
+# 0 means "leave the cache size to the user's mpv.conf".
+PLAYER_CACHE_MB = _env_int("OMARCHY_YOUTUBE_CACHE_MB", 0, 0, 4096)
+VIDEO_FORMAT = "bestvideo[height<=720]+bestaudio/best[height<=720]"
+AUDIO_FORMAT = "bestaudio/best"
 
 
 class ResponseLimitError(subprocess.SubprocessError):
@@ -87,9 +109,34 @@ def format_duration(seconds: object) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
+def _queue_items(value: object) -> list:
+    items = []
+    if not isinstance(value, list):
+        return items
+    for raw in value[:MAX_QUEUE_ITEMS]:
+        if not isinstance(raw, dict):
+            continue
+        url = _safe_http_url(raw.get("url"))
+        if not url:
+            continue
+        items.append({
+            "url": url,
+            "title": _bounded_text(raw.get("title"), MAX_TITLE_CHARS) or "YouTube video",
+            "channel": _bounded_text(raw.get("channel"), MAX_CHANNEL_CHARS),
+            "thumbnail": _safe_http_url(raw.get("thumbnail"), MAX_THUMBNAIL_CHARS),
+        })
+    return items
+
+
 def _state_data(data: object) -> dict:
     if not isinstance(data, dict):
         return {}
+    queue = _queue_items(data.get("queue"))
+    try:
+        index = int(data.get("queueIndex") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    index = min(max(index, 0), max(len(queue) - 1, 0))
     return {
         "url": _safe_http_url(data.get("url")),
         "title": _bounded_text(data.get("title"), MAX_TITLE_CHARS),
@@ -97,6 +144,8 @@ def _state_data(data: object) -> dict:
         "thumbnail": _safe_http_url(data.get("thumbnail"), MAX_THUMBNAIL_CHARS),
         "audioOnly": bool(data.get("audioOnly")),
         "workspace": _bounded_text(data.get("workspace"), MAX_WORKSPACE_CHARS),
+        "queue": queue,
+        "queueIndex": index,
     }
 
 
@@ -249,18 +298,18 @@ def normalize_window(restore_address: str = "") -> None:
         return
     address = _bounded_text(player.get("address"), MAX_WORKSPACE_CHARS)
     active_address = active_window_address()
-    size = player.get("size") or [480, 270]
+    size = player.get("size") or [PLAYER_WIDTH, PLAYER_HEIGHT]
 
     def dispatch(expression: str) -> None:
         subprocess.run(["hyprctl", "dispatch", expression], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4, check=False)
 
     if address and address != active_address:
         dispatch(f'''hl.dsp.focus({{ window = "address:{address}" }})''')
-    width_delta = 480 - int(size[0])
-    height_delta = 270 - int(size[1])
+    width_delta = PLAYER_WIDTH - int(size[0])
+    height_delta = PLAYER_HEIGHT - int(size[1])
     if width_delta or height_delta:
         dispatch(f"hl.dsp.window.resize({{ x = {width_delta}, y = {height_delta}, relative = true }})")
-    dispatch("hl.dsp.window.move({ x = 24, y = 64, relative = false })")
+    dispatch(f"hl.dsp.window.move({{ x = {PLAYER_X}, y = {PLAYER_Y}, relative = false }})")
     if restore_address and restore_address != address:
         dispatch(f'''hl.dsp.focus({{ window = "address:{restore_address}" }})''')
 
@@ -297,37 +346,155 @@ def player_workspace() -> str:
     return _bounded_text(workspace.get("name"), MAX_WORKSPACE_CHARS) if isinstance(workspace, dict) else ""
 
 
-def ensure_player() -> None:
-    restore_address = active_window_address()
+_PLAYER_MODE_OVERRIDE: bool | None = None
+
+
+def _audio_only_state() -> bool:
+    state = read_state()
+    # An empty/idle state always carries "audioOnly": false because of
+    # normalization, which would wrongly force a windowed player. When nothing
+    # is loaded, defer to the configured default instead.
+    if not state.get("url") and not state.get("queue"):
+        return _audio_only_default()
+    return bool(state.get("audioOnly"))
+
+
+def _desired_windowed() -> bool:
+    if _PLAYER_MODE_OVERRIDE is not None:
+        return _PLAYER_MODE_OVERRIDE
+    return not _audio_only_state()
+
+
+def _raw_get_property(name: str) -> object:
+    try:
+        return _send_ipc(["get_property", name], request_id=7)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _player_pids() -> list[int]:
+    """PIDs of mpv processes that own this plugin's IPC socket."""
+    marker = str(SOCKET_PATH).encode("utf-8")
+    pids: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                cmdline = handle.read()
+        except OSError:
+            continue
+        argv0 = cmdline.split(b"\x00", 1)[0]
+        if not (argv0 == b"mpv" or argv0.endswith(b"/mpv")):
+            continue
+        if marker in cmdline:
+            pids.append(int(entry))
+    return pids
+
+
+def _vo_name(value: object) -> str:
+    # mpv reports ``vo`` as a list of objects, e.g. [{"name": "null", ...}].
+    if isinstance(value, list) and value:
+        first = value[0]
+        if isinstance(first, dict):
+            return str(first.get("name", ""))
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _running_windowed() -> bool | None:
+    if not socket_is_alive():
+        return None
+    voi = _raw_get_property("vo")
+    if voi is None:
+        return None
+    return _vo_name(voi) not in ("", "null")
+
+
+def _stop_player() -> None:
     if socket_is_alive():
-        normalize_window(restore_address)
-        return
+        try:
+            _send_ipc(["quit"])
+        except (OSError, RuntimeError):
+            pass
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not _player_pids():
+            return
+        time.sleep(0.05)
+    for pid in _player_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.1)
+
+
+def ensure_player() -> None:
+    desired_windowed = _desired_windowed()
+    alive = socket_is_alive()
+    if alive:
+        running_windowed = _running_windowed()
+        if running_windowed == desired_windowed:
+            if desired_windowed:
+                normalize_window(active_window_address())
+            return
+        # Audio and video need different players (windowed vs headless), so tear
+        # the current one down and relaunch it below.
+        _stop_player()
+    elif _player_pids():
+        # An mpv is still running but its socket is unreachable; clear it first so
+        # we never end up with two players fighting over the same socket.
+        _stop_player()
+    restore_address = active_window_address() if desired_windowed else ""
     try:
         SOCKET_PATH.unlink()
     except FileNotFoundError:
         pass
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        "mpv",
-        "--no-terminal",
-        "--force-window=immediate",
-        "--focus-on=never",
-        "--force-window-position",
-        "--ontop-level=system",
-        "--player-operation-mode=pseudo-gui",
-        "--title=Omarchy YouTube",
-        "--input-ipc-server=" + str(SOCKET_PATH),
-        "--geometry=480x270+24+64",
-        "--autofit=480x270",
-        "--ytdl-format=bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "--idle=yes",
-        "--keep-open=yes",
-    ]
+    if desired_windowed:
+        command = [
+            "mpv",
+            "--no-terminal",
+            "--no-resume-playback",
+            "--save-position-on-quit=no",
+            "--force-window=immediate",
+            "--focus-on=never",
+            "--force-window-position",
+            "--ontop-level=system",
+            "--player-operation-mode=pseudo-gui",
+            "--title=Omarchy YouTube",
+            "--input-ipc-server=" + str(SOCKET_PATH),
+            "--geometry=" + f"{PLAYER_WIDTH}x{PLAYER_HEIGHT}+{PLAYER_X}+{PLAYER_Y}",
+            "--autofit=" + f"{PLAYER_WIDTH}x{PLAYER_HEIGHT}",
+            "--ytdl-format=" + VIDEO_FORMAT,
+            "--idle=yes",
+            "--keep-open=yes",
+        ]
+    else:
+        # Headless: no window at all for audio-only playback.
+        command = [
+            "mpv",
+            "--no-terminal",
+            "--no-resume-playback",
+            "--save-position-on-quit=no",
+            "--no-video",
+            "--vo=null",
+            "--force-window=no",
+            "--input-ipc-server=" + str(SOCKET_PATH),
+            "--ytdl-format=" + AUDIO_FORMAT,
+            "--idle=yes",
+            "--keep-open=yes",
+        ]
+    if PLAYER_CACHE_MB > 0:
+        command.append("--demuxer-max-bytes=" + f"{PLAYER_CACHE_MB}MiB")
     subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if socket_is_alive():
-            normalize_window(restore_address)
+            if desired_windowed:
+                normalize_window(restore_address)
             return
         time.sleep(0.05)
     raise RuntimeError("mpv did not open its IPC socket")
@@ -335,6 +502,10 @@ def ensure_player() -> None:
 
 def ipc(command: list[object], request_id: int = 1) -> object:
     ensure_player()
+    return _send_ipc(command, request_id)
+
+
+def _send_ipc(command: list[object], request_id: int = 1) -> object:
     payload = (json.dumps({"command": command, "request_id": request_id}) + "\n").encode("utf-8")
     if len(payload) > MAX_SOCKET_BYTES:
         raise ResponseLimitError("IPC request exceeds its size limit")
@@ -380,41 +551,52 @@ def get_property(name: str) -> object:
 
 
 def metadata_for(url: str) -> dict:
+    # Ask yt-dlp for only the fields we use. A full --dump-single-json payload is
+    # hundreds of KiB per video (every format/storyboard), which overruns the
+    # bounded-process limit; field selection keeps it to a few hundred bytes.
     command = [
         "yt-dlp",
-        "--dump-single-json",
         "--flat-playlist",
         "--skip-download",
         "--no-warnings",
         "--playlist-end",
         "1",
+        "--print",
+        "%(.{id,title,channel,uploader,thumbnail,duration})j",
         url,
     ]
     code, stdout, stderr = _run_bounded_text(command, timeout=25)
     if code != 0:
         raise RuntimeError(stderr.strip()[:MAX_TITLE_CHARS] or "yt-dlp could not read this video")
-    data = json.loads(stdout)
-    if not isinstance(data, dict):
-        raise ValueError("yt-dlp returned an invalid object")
-    entries = data.get("entries")
-    if isinstance(entries, list) and entries:
-        data = next((entry for entry in entries if isinstance(entry, dict)), {})
-    return data
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    raise ValueError("yt-dlp returned no usable metadata")
 
 
 def search(query: str, lang: str) -> dict:
     query = query.strip()[:160]
     if not query:
         return {"ok": False, "message": _t("Escribe algo para buscar.", "Type something to search.", lang)}
+    # YouTube search returns channels/playlists as well as videos; ask for a few
+    # extra so filtering still leaves MAX_RESULTS real videos.
+    fetch_count = MAX_RESULTS + 5
     command = [
         "yt-dlp",
         "--flat-playlist",
         "--dump-single-json",
         "--playlist-end",
-        "8",
+        str(fetch_count),
         "--no-warnings",
         "--quiet",
-        "ytsearch8:" + query,
+        "ytsearch%d:" % fetch_count + query,
     ]
     code, stdout, _ = _run_bounded_text(command, timeout=35)
     if code != 0:
@@ -427,11 +609,18 @@ def search(query: str, lang: str) -> dict:
         return {"ok": False, "message": _t("La respuesta de YouTube no fue válida.", "YouTube returned an invalid response.", lang)}
     entries = []
     source_entries = data.get("entries") if isinstance(data.get("entries"), list) else []
-    for item in source_entries[:MAX_RESULTS]:
+    for item in source_entries:
+        if len(entries) >= MAX_RESULTS:
+            break
         if not isinstance(item, dict):
             continue
+        # Skip channel/playlist results (YouTubeTab, YoutubePlaylist, ...): only
+        # real videos have an 11-character video id and ie_key "Youtube".
+        ie_key = _bounded_text(item.get("ie_key"), 32)
+        if ie_key and ie_key != "Youtube":
+            continue
         video_id = _bounded_text(item.get("id"), 64)
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+        if not VIDEO_ID_RE.fullmatch(video_id):
             continue
         entries.append({
             "id": video_id,
@@ -444,35 +633,168 @@ def search(query: str, lang: str) -> dict:
     return {"ok": True, "results": entries}
 
 
-def play(url: str, lang: str) -> dict:
-    if not valid_video_url(url):
-        return {"ok": False, "message": _t("La URL no parece ser de YouTube.", "That URL does not look like YouTube.", lang)}
-    restore_address = active_window_address()
+def _audio_only_default() -> bool:
+    value = os.environ.get("OMARCHY_YOUTUBE_AUDIO_ONLY", "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def _play_queue(items: list, index: int, lang: str, audio_only: bool | None = None) -> dict:
+    if not items:
+        return {"ok": False, "message": _t("No hay nada para reproducir.", "Nothing to play.", lang)}
+    index = min(max(index, 0), len(items) - 1)
+    # Rotate so the chosen track is entry 0: mpv then plays it immediately and
+    # keeps the rest as the following playlist (wrapping at the end). This avoids
+    # racing playlist-play-index against the first file's yt-dlp resolution.
+    ordered = items[index:] + items[:index]
+    if audio_only is None:
+        audio_only = _audio_only_default()
+    global _PLAYER_MODE_OVERRIDE
+    _PLAYER_MODE_OVERRIDE = not audio_only
     previous_state = read_state()
+    restore_address = active_window_address() if not audio_only else ""
     try:
-        data = metadata_for(url)
-        title = _bounded_text(data.get("title"), MAX_TITLE_CHARS) or "YouTube video"
-        channel = _bounded_text(data.get("channel") or data.get("uploader"), MAX_CHANNEL_CHARS)
-        thumbnail = _safe_http_url(data.get("thumbnail"), MAX_THUMBNAIL_CHARS)
-        ipc(["loadfile", url, "replace"])
+        ipc(["set_property", "ytdl-format", AUDIO_FORMAT if audio_only else VIDEO_FORMAT])
+        ipc(["stop"])
+        for position, item in enumerate(ordered):
+            ipc(["loadfile", item["url"], "replace" if position == 0 else "append"])
         ipc(["set_property", "pause", False])
-        if previous_state.get("audioOnly"):
+        current = ordered[0]
+        ipc(["set_property", "force-media-title", current["title"]])
+        if audio_only:
+            # Headless player: there is no window to manage.
+            ipc(["set_property", "vid", "no"])
+        else:
             ipc(["set_property", "vid", "auto"])
-            move_player_to_workspace(previous_state.get("workspace", ""))
-        normalize_window(restore_address)
-        write_state({"url": url, "title": title, "channel": channel, "thumbnail": thumbnail, "audioOnly": False})
-        return {"ok": True, "title": title, "channel": channel, "thumbnail": thumbnail, "url": url}
+            ipc(["set_property", "window-minimized", False])
+            if previous_state.get("audioOnly") and previous_state.get("workspace"):
+                move_player_to_workspace(previous_state.get("workspace", ""))
+            normalize_window(restore_address)
+        write_state({
+            "url": current["url"],
+            "title": current["title"],
+            "channel": current.get("channel", ""),
+            "thumbnail": current.get("thumbnail", ""),
+            "audioOnly": audio_only,
+            "windowed": not audio_only,
+            "queue": ordered,
+            "queueIndex": 0,
+            "workspace": previous_state.get("workspace", ""),
+        })
+        return {
+            "ok": True,
+            "title": current["title"],
+            "channel": current.get("channel", ""),
+            "thumbnail": current.get("thumbnail", ""),
+            "url": current["url"],
+            "audioOnly": audio_only,
+            "queueIndex": 0,
+            "queueCount": len(ordered),
+        }
     except (OSError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         return {"ok": False, "message": _t("No se pudo reproducir este video.", "This video could not be played.", lang), "detail": str(error)[:180]}
 
 
-def action(name: str, lang: str) -> dict:
+def play(url: str, lang: str) -> dict:
+    if not valid_video_url(url):
+        return {"ok": False, "message": _t("La URL no parece ser de YouTube.", "That URL does not look like YouTube.", lang)}
+    try:
+        data = metadata_for(url)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        return {"ok": False, "message": _t("No se pudo reproducir este video.", "This video could not be played.", lang), "detail": str(error)[:180]}
+    title = _bounded_text(data.get("title"), MAX_TITLE_CHARS) or "YouTube video"
+    channel = _bounded_text(data.get("channel") or data.get("uploader"), MAX_CHANNEL_CHARS)
+    thumbnail = _safe_http_url(data.get("thumbnail"), MAX_THUMBNAIL_CHARS)
+    if not thumbnail:
+        video_id = _bounded_text(data.get("id"), 64)
+        if VIDEO_ID_RE.fullmatch(video_id):
+            thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return _play_queue([{"url": url, "title": title, "channel": channel, "thumbnail": thumbnail}], 0, lang)
+
+
+def playlist_command(start: str | None, payload: str | None, lang: str) -> dict:
+    try:
+        index = int(start or "0")
+    except (TypeError, ValueError):
+        index = 0
+    try:
+        raw = json.loads(payload or "[]")
+    except json.JSONDecodeError:
+        return {"ok": False, "message": _t("Lista de reproducción no válida.", "Invalid playlist.", lang)}
+    items = _queue_items(raw)
+    if not items:
+        return {"ok": False, "message": _t("No hay resultados para reproducir.", "Nothing to play.", lang)}
+    return _play_queue(items, index, lang)
+
+
+def _reload_format(audio_only: bool) -> None:
+    """Reload the current queue with the matching yt-dlp format, keeping position.
+
+    Toggling audio-only turns off the video track, but a stream already opened
+    with a muxed format keeps downloading video. Reloading with bestaudio stops
+    that, while keeping the whole queue (and its index) so next/previous and the
+    media keys keep working.
+    """
+    state = read_state()
+    queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+    url = state.get("url", "")
+    if not queue and valid_video_url(url):
+        queue = [{
+            "url": url,
+            "title": state.get("title", ""),
+            "channel": state.get("channel", ""),
+            "thumbnail": state.get("thumbnail", ""),
+        }]
+    if not queue:
+        return
+    try:
+        index = int(state.get("queueIndex") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    index = min(max(index, 0), len(queue) - 1)
+    ordered = queue[index:] + queue[:index]
+    position = get_property("time-pos")
+    paused = get_property("pause") is True
+    global _PLAYER_MODE_OVERRIDE
+    _PLAYER_MODE_OVERRIDE = not audio_only
+    ipc(["set_property", "ytdl-format", AUDIO_FORMAT if audio_only else VIDEO_FORMAT])
+    ipc(["stop"])
+    for item_index, item in enumerate(ordered):
+        ipc(["loadfile", item["url"], "replace" if item_index == 0 else "append"])
+    if isinstance(position, (int, float)) and position > 0:
+        try:
+            ipc(["seek", float(position), "absolute"])
+        except (OSError, RuntimeError):
+            # The reloaded stream may not be seekable yet; ignore and let it play
+            # from the start rather than failing the whole toggle.
+            pass
+    ipc(["set_property", "force-media-title", ordered[0]["title"]])
+    if paused:
+        ipc(["set_property", "pause", True])
+    state["queue"] = ordered
+    state["queueIndex"] = 0
+    state["audioOnly"] = audio_only
+    state["windowed"] = not audio_only
+    write_state(state)
+
+
+def action(name: str, lang: str, extra: str = "") -> dict:
     try:
         if name == "pause":
             ipc(["cycle", "pause"])
         elif name == "stop":
-            ipc(["stop"])
             write_state({})
+            if socket_is_alive():
+                ipc(["quit"])
+        elif name == "next":
+            ipc(["playlist-next"])
+        elif name == "prev":
+            ipc(["playlist-prev"])
+        elif name == "seek":
+            try:
+                seconds = max(0.0, float(extra))
+            except (TypeError, ValueError):
+                return {"ok": False, "message": _t("Posición no válida.", "Invalid position.", lang)}
+            ipc(["seek", seconds, "absolute"])
         elif name == "back":
             ipc(["seek", -10, "relative"])
         elif name == "forward":
@@ -482,30 +804,37 @@ def action(name: str, lang: str) -> dict:
         elif name == "volume-down":
             ipc(["add", "volume", -5])
         elif name == "fullscreen":
-            ipc(["cycle", "fullscreen"])
-        elif name == "show":
-            ipc(["set_property", "window-minimized", False])
-            normalize_window(active_window_address())
-        elif name == "audio-only":
+            # Headless (audio-only) players have no window to fullscreen.
+            if _running_windowed() is not False:
+                ipc(["cycle", "fullscreen"])
+        elif name == "resume":
             state = read_state()
+            queue = state.get("queue") or []
+            if not queue or socket_is_alive():
+                return {"ok": True, "resumed": False}
+            result = _play_queue(queue, int(state.get("queueIndex") or 0), lang, audio_only=bool(state.get("audioOnly")))
+            if result.get("ok"):
+                result["resumed"] = True
+            return result
+        elif name == "show":
+            if _running_windowed() is not False:
+                ipc(["set_property", "window-minimized", False])
+                normalize_window(active_window_address())
+        elif name == "audio-only":
             workspace = player_workspace()
             if workspace and not workspace.startswith("special:"):
-                state["workspace"] = workspace
-            ipc(["set_property", "vid", "no"])
-            ipc(["set_property", "window-minimized", True])
-            move_player_to_workspace("special:youtube-audio")
-            state["audioOnly"] = True
-            write_state(state)
+                current = read_state()
+                current["workspace"] = workspace
+                write_state(current)
+            _reload_format(True)
         elif name == "show-video":
+            _reload_format(False)
             state = read_state()
-            ipc(["set_property", "vid", "auto"])
-            ipc(["set_property", "window-minimized", False])
             move_player_to_workspace(state.get("workspace", ""))
             normalize_window(active_window_address())
-            state["audioOnly"] = False
-            write_state(state)
         elif name == "quit":
-            ipc(["quit"])
+            if socket_is_alive():
+                ipc(["quit"])
             write_state({})
         else:
             return {"ok": False, "message": _t("Acción no reconocida.", "Unknown action.", lang)}
@@ -514,32 +843,184 @@ def action(name: str, lang: str) -> dict:
         return {"ok": False, "message": _t("El reproductor no está disponible.", "The player is not available.", lang), "detail": str(error)[:180]}
 
 
+def _status_snapshot(values: dict, state: dict) -> dict:
+    queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+    position = values.get("playlist-pos")
+    if not isinstance(position, int) or position < 0:
+        try:
+            position = int(state.get("queueIndex") or 0)
+        except (TypeError, ValueError):
+            position = 0
+    current = queue[position] if 0 <= position < len(queue) else {}
+    title = _bounded_text(current.get("title") or values.get("media-title") or state.get("title"), MAX_TITLE_CHARS)
+    idle = values.get("idle-active")
+    pause = values.get("pause")
+    active = bool(title) and not bool(idle)
+    return {
+        "ok": True,
+        "active": active,
+        "playing": active and pause is False,
+        "title": title,
+        "channel": _bounded_text(current.get("channel") or state.get("channel"), MAX_CHANNEL_CHARS),
+        "thumbnail": _safe_http_url(current.get("thumbnail") or state.get("thumbnail"), MAX_THUMBNAIL_CHARS),
+        "url": _safe_http_url(current.get("url") or state.get("url")),
+        "position": _bounded_number(values.get("time-pos")),
+        "durationSeconds": _bounded_number(values.get("duration")),
+        "fullscreen": bool(values.get("fullscreen")),
+        "audioOnly": bool(state.get("audioOnly")) or values.get("vid") == "no",
+        "queueIndex": position if queue else -1,
+        "queueCount": len(queue),
+    }
+
+
 def status() -> dict:
     state = read_state()
     if not socket_is_alive():
         return {"ok": True, "active": False, **state}
-    idle = get_property("idle-active")
-    title = _bounded_text(get_property("media-title") or state.get("title"), MAX_TITLE_CHARS)
-    pause = get_property("pause")
-    return {
-        "ok": True,
-        "active": bool(title) and not bool(idle),
-        "playing": bool(title) and not bool(idle) and pause is False,
-        "title": title,
-        "channel": _bounded_text(state.get("channel"), MAX_CHANNEL_CHARS),
-        "thumbnail": _safe_http_url(state.get("thumbnail"), MAX_THUMBNAIL_CHARS),
-        "url": _safe_http_url(state.get("url")),
-        "position": _bounded_number(get_property("time-pos")),
-        "durationSeconds": _bounded_number(get_property("duration")),
-        "fullscreen": bool(get_property("fullscreen")),
-        "audioOnly": bool(state.get("audioOnly")) or get_property("vid") == "no",
+    values = {
+        "idle-active": get_property("idle-active"),
+        "media-title": get_property("media-title"),
+        "pause": get_property("pause"),
+        "time-pos": get_property("time-pos"),
+        "duration": get_property("duration"),
+        "fullscreen": get_property("fullscreen"),
+        "vid": get_property("vid"),
+        "playlist-pos": get_property("playlist-pos"),
+        "playlist-count": get_property("playlist-count"),
     }
+    return _status_snapshot(values, state)
+
+
+WATCH_PROPERTIES = ("time-pos", "pause", "duration", "media-title", "idle-active", "vid", "fullscreen", "playlist-pos", "playlist-count")
+WATCH_INTERVAL = 0.5
+
+
+def watch() -> int:
+    """Stream status as newline-delimited JSON, reconnecting across mpv restarts.
+
+    One long-lived process replaces the per-poll ``status`` spawns, so the bar
+    gets live updates without starting a Python interpreter every time. It stays
+    alive when mpv exits and reconnects once a new player appears.
+    """
+    running = True
+
+    def stop_handler(*_args: object) -> None:
+        nonlocal running
+        running = False
+
+    for handled in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(handled, stop_handler)
+        except (OSError, ValueError):
+            pass
+
+    def announce_inactive(state: dict) -> None:
+        print(json.dumps({"ok": True, "active": False, **state}, ensure_ascii=False), flush=True)
+
+    def stream(connection: socket.socket) -> None:
+        values: dict[str, object] = {"idle-active": True}
+        state = read_state()
+        for index, name in enumerate(WATCH_PROPERTIES, start=1):
+            connection.sendall(
+                (json.dumps({"command": ["observe_property", index, name], "request_id": index}) + "\n").encode("utf-8")
+            )
+        buffer = b""
+        last_emit = 0.0
+        force_emit = True
+        while running:
+            try:
+                connection.settimeout(WATCH_INTERVAL)
+                chunk = connection.recv(65536)
+            except socket.timeout:
+                chunk = None
+            except OSError:
+                break
+            if chunk == b"":
+                break
+            if chunk:
+                buffer += chunk
+                *lines, buffer = buffer.split(b"\n")
+                for raw in lines:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        message = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    event = message.get("event")
+                    name = message.get("name")
+                    if event == "property-change" and name in WATCH_PROPERTIES:
+                        values[name] = message.get("data")
+                        if name != "time-pos":
+                            force_emit = True
+                        if name == "playlist-pos":
+                            # Keep mpv's display title (and MPRIS metadata) in sync
+                            # with our own queue so the shell OSD shows the right name.
+                            state = read_state()
+                            queue = state.get("queue") if isinstance(state.get("queue"), list) else []
+                            position = message.get("data")
+                            if isinstance(position, int) and 0 <= position < len(queue):
+                                try:
+                                    connection.sendall(
+                                        (json.dumps({
+                                            "command": ["set_property", "force-media-title", queue[position]["title"]],
+                                            "request_id": 900,
+                                        }) + "\n").encode("utf-8")
+                                    )
+                                except OSError:
+                                    break
+                    elif event == "end-file":
+                        values["idle-active"] = True
+                        force_emit = True
+            now = time.monotonic()
+            if force_emit or now - last_emit >= WATCH_INTERVAL:
+                print(json.dumps(_status_snapshot(values, state), ensure_ascii=False), flush=True)
+                last_emit = now
+                force_emit = False
+
+    announced_inactive = False
+    while running:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(0.4)
+        connected = False
+        for _ in range(10):
+            try:
+                connection.connect(str(SOCKET_PATH))
+                connected = True
+                break
+            except OSError:
+                if not running:
+                    break
+                time.sleep(0.2)
+        if not connected:
+            connection.close()
+            if not announced_inactive:
+                announce_inactive(read_state())
+                announced_inactive = True
+            time.sleep(1.0)
+            continue
+        announced_inactive = False
+        try:
+            stream(connection)
+        except OSError:
+            pass
+        finally:
+            connection.close()
+        if not announced_inactive:
+            announce_inactive(read_state())
+            announced_inactive = True
+        time.sleep(0.5)
+
+    return 0
+
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["search", "play", "action", "status"])
+    parser.add_argument("command", choices=["search", "play", "playlist", "action", "status", "watch"])
     parser.add_argument("value", nargs="?")
+    parser.add_argument("extra", nargs="?")
     parser.add_argument("--lang", choices=["es", "en"], default="en")
     args = parser.parse_args()
     try:
@@ -547,8 +1028,12 @@ def main() -> int:
             output = search(args.value or "", args.lang)
         elif args.command == "play":
             output = play(args.value or "", args.lang)
+        elif args.command == "playlist":
+            output = playlist_command(args.value, args.extra, args.lang)
         elif args.command == "action":
-            output = action(args.value or "", args.lang)
+            output = action(args.value or "", args.lang, args.extra or "")
+        elif args.command == "watch":
+            return watch()
         else:
             output = status()
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:

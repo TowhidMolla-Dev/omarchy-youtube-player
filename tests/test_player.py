@@ -11,6 +11,10 @@ SPEC = importlib.util.spec_from_file_location("player", Path(__file__).parents[1
 player = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(player)
 
+# Pin config that would otherwise be read from the ambient environment so the
+# search tests stay deterministic regardless of the user's OMARCHY_YOUTUBE_* vars.
+player.MAX_RESULTS = 8
+
 
 class PlayerHelpersTest(unittest.TestCase):
     def test_accepts_youtube_video_and_short_url(self):
@@ -53,7 +57,8 @@ class PlayerHelpersTest(unittest.TestCase):
 
     def test_search_caps_results_and_fields_before_qml(self):
         payload = {"entries": [{
-            "id": "abc123",
+            "id": "abcdefghijk",
+            "ie_key": "Youtube",
             "title": "x" * 500,
             "channel": "c" * 500,
             "duration": 65,
@@ -65,6 +70,32 @@ class PlayerHelpersTest(unittest.TestCase):
         self.assertLessEqual(len(result["results"][0]["title"]), 180)
         self.assertLessEqual(len(result["results"][0]["channel"]), 100)
         self.assertLessEqual(len(result["results"][0]["thumbnail"]), 512)
+
+    def test_search_skips_channels_and_playlists(self):
+        payload = {"entries": [
+            {"id": "UCSJ4gkVC6NrvII8umztf0Ow", "ie_key": "YoutubeTab", "title": "A channel"},
+            {"id": "PLsomeplaylistid000000000000", "ie_key": "YoutubePlaylist", "title": "A playlist"},
+            {"id": "dQw4w9WgXcQ", "ie_key": "Youtube", "title": "A video", "channel": "someone"},
+        ]}
+        with patch.object(player, "_run_bounded_text", return_value=(0, json.dumps(payload), "")):
+            result = player.search("test", "en")
+        self.assertEqual([item["id"] for item in result["results"]], ["dQw4w9WgXcQ"])
+
+    def test_state_persists_queue_and_clamps_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = player.STATE_PATH
+            try:
+                player.STATE_PATH = Path(directory) / "state" / "state.json"
+                queue = [
+                    {"url": "https://www.youtube.com/watch?v=aaaaaaaaaaa", "title": "one"},
+                    {"url": "https://www.youtube.com/watch?v=bbbbbbbbbbb", "title": "two"},
+                ]
+                player.write_state({"queue": queue, "queueIndex": 99})
+                state = player.read_state()
+                self.assertEqual(len(state["queue"]), 2)
+                self.assertEqual(state["queueIndex"], 1)
+            finally:
+                player.STATE_PATH = original
 
 
 if __name__ == "__main__":

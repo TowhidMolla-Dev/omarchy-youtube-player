@@ -21,14 +21,24 @@ BarWidget {
   property string statusMessage: ""
   property string title: ""
   property string channel: ""
+  property string thumbnail: ""
   property string currentUrl: ""
+  property string failedUrl: ""
   property bool playing: false
   property bool active: false
   property bool audioOnly: false
   property real position: 0
   property real durationSeconds: 0
+  property int queueIndex: -1
+  property int queueCount: 0
   property var results: []
   readonly property int maxJsonChars: 262144
+  readonly property var presets: [
+    { label: "Lofi", query: "lofi hip hop radio" },
+    { label: "Focus", query: "deep focus music" },
+    { label: "Jazz", query: "jazz music" },
+    { label: "Classical", query: "classical music" }
+  ]
 
   function words(es, en) { return isSpanish ? es : en }
   function run(args) {
@@ -44,10 +54,35 @@ BarWidget {
     searchProcess.command = ["python3", helperPath, "search", term, "--lang", lang]
     searchProcess.running = true
   }
+  function searchPreset(term) {
+    searchField.text = term
+    search()
+  }
   function playUrl(url) {
     busy = true
+    failedUrl = url
     statusMessage = words("Cargando video…", "Loading video…")
     run(["play", url])
+  }
+  function playResults(index) {
+    if (!root.results.length) return
+    var payload = []
+    for (var i = 0; i < root.results.length; i += 1) {
+      var item = root.results[i]
+      payload.push({ url: item.url, title: item.title, channel: item.channel, thumbnail: item.thumbnail })
+    }
+    busy = true
+    failedUrl = ""
+    statusMessage = words("Cargando…", "Loading…")
+    run(["playlist", String(index), JSON.stringify(payload)])
+  }
+  function retry() {
+    if (failedUrl) playUrl(failedUrl)
+  }
+  function seekTo(seconds) {
+    if (durationSeconds <= 0) return
+    position = Math.max(0, Math.min(seconds, durationSeconds))
+    run(["action", "seek", String(position)])
   }
   function refreshStatus() {
     if (statusProcess.running) return
@@ -88,8 +123,22 @@ BarWidget {
         }
       } else if (kind === "action") {
         busy = false
-        if (!data.ok) statusMessage = data.message || words("El reproductor no está disponible.", "The player is not available.")
-        else statusMessage = ""
+        if (!data.ok) {
+          statusMessage = data.message || words("El reproductor no está disponible.", "The player is not available.")
+        } else {
+          statusMessage = ""
+          failedUrl = ""
+          if (data.title) {
+            active = true
+            title = String(data.title || "").slice(0, 180)
+            channel = String(data.channel || "").slice(0, 100)
+            thumbnail = String(data.thumbnail || "").slice(0, 512)
+            currentUrl = String(data.url || currentUrl).slice(0, 2048)
+            audioOnly = !!data.audioOnly
+            queueCount = Number(data.queueCount || 0)
+            queueIndex = Number(data.queueIndex || 0)
+          }
+        }
         refreshStatus()
       } else {
         busy = false
@@ -98,10 +147,14 @@ BarWidget {
           playing = !!data.playing
           title = String(data.title || "").slice(0, 180)
           channel = String(data.channel || "").slice(0, 100)
+          thumbnail = String(data.thumbnail || "").slice(0, 512)
           currentUrl = String(data.url || currentUrl).slice(0, 2048)
           position = Number(data.position || 0)
           durationSeconds = Number(data.durationSeconds || 0)
           audioOnly = !!data.audioOnly
+          queueIndex = Number(data.queueIndex !== undefined ? data.queueIndex : -1)
+          queueCount = Number(data.queueCount || 0)
+          if (active) failedUrl = ""
         }
       }
     } catch (error) {
@@ -126,13 +179,6 @@ BarWidget {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Timer {
-    interval: 1200
-    repeat: true
-    running: root.active
-    onTriggered: root.refreshStatus()
-  }
-
   BarIconButton {
     id: button
     anchors.fill: parent
@@ -151,6 +197,40 @@ BarWidget {
     function open() { root.open(); return "ok" }
     function close() { root.close(); return "ok" }
     function toggle() { root.toggle(); return "ok" }
+    function playPause() { root.run(["action", "pause"]); return "ok" }
+    function next() { root.run(["action", "next"]); return "ok" }
+    function previous() { root.run(["action", "prev"]); return "ok" }
+    function stop() { root.run(["action", "stop"]); return "ok" }
+  }
+
+  Process {
+    id: watchProcess
+    stdout: SplitParser {
+      onRead: function(line) { root.handleJson(line, "status") }
+    }
+    onExited: function(exitCode) {
+      if (root.active) {
+        // mpv went away; clear state and restart watch
+        active = false
+        playing = false
+        title = ""
+        channel = ""
+        thumbnail = ""
+        currentUrl = ""
+        position = 0
+        durationSeconds = 0
+        audioOnly = false
+        queueIndex = -1
+        queueCount = 0
+      }
+    }
+  }
+
+  Component.onCompleted: {
+    watchProcess.command = ["python3", helperPath, "watch"]
+    watchProcess.running = true
+    // Replay the last track/queue if mpv is gone (e.g. after a reboot).
+    root.run(["action", "resume"])
   }
 
   Process {
@@ -258,15 +338,42 @@ BarWidget {
         }
       }
 
-      Text {
-    textFormat: Text.PlainText
-        visible: root.statusMessage !== ""
+      Row {
         width: parent.width
-        text: root.statusMessage
-        color: root.dim
-        font.family: Style.font.menuFamily
-        font.pixelSize: Style.font.bodySmall
-        wrapMode: Text.Wrap
+        spacing: Style.space(6)
+        Repeater {
+          model: root.presets
+          delegate: Button {
+            required property var modelData
+            focusable: true
+            enabled: !root.busy
+            text: modelData.label
+            onClicked: root.searchPreset(modelData.query)
+          }
+        }
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+        visible: root.statusMessage !== "" || root.failedUrl !== ""
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width - (retryButton.visible ? retryButton.width + Style.space(6) : 0)
+          text: root.statusMessage
+          visible: root.statusMessage !== ""
+          color: root.dim
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+        Button {
+          id: retryButton
+          focusable: true
+          visible: root.failedUrl !== ""
+          text: root.words("Reintentar", "Retry")
+          onClicked: root.retry()
+        }
       }
 
       Column {
@@ -282,35 +389,65 @@ BarWidget {
           font.bold: true
           font.letterSpacing: 1
         }
-        Text {
-    textFormat: Text.PlainText
+        Row {
           width: parent.width
-          text: root.title
-          color: root.foreground
-          font.family: Style.font.menuFamily
-          font.pixelSize: Style.font.subtitle
-          font.bold: true
-          elide: Text.ElideRight
-        }
-        Text {
+          spacing: Style.space(10)
+          Image {
+            id: nowThumb
+            width: Style.space(96)
+            height: Style.space(54)
+            anchors.verticalCenter: parent.verticalCenter
+            source: root.thumbnail || ""
+            visible: root.thumbnail !== ""
+            fillMode: Image.PreserveAspectCrop
+            asynchronous: true
+            clip: true
+          }
+          Column {
+            width: parent.width - (nowThumb.visible ? nowThumb.width + Style.space(10) : 0)
+            spacing: Style.space(3)
+            Text {
     textFormat: Text.PlainText
-          width: parent.width
-          text: root.channel
-          visible: text !== ""
-          color: root.dim
-          font.family: Style.font.menuFamily
-          font.pixelSize: Style.font.bodySmall
-          elide: Text.ElideRight
+              width: parent.width
+              text: root.title
+              color: root.foreground
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+              elide: Text.ElideRight
+            }
+            Text {
+    textFormat: Text.PlainText
+              width: parent.width
+              text: root.channel
+              visible: text !== ""
+              color: root.dim
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+            Text {
+    textFormat: Text.PlainText
+              width: parent.width
+              visible: root.queueCount > 1
+              text: (root.queueIndex + 1) + " / " + root.queueCount
+              color: root.dim
+              font.family: Style.font.menuFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
         }
         Row {
           width: parent.width
           spacing: Style.space(6)
+          Button { focusable: true; enabled: root.queueCount > 1; text: "󰒮"; onClicked: root.run(["action", "prev"]) }
           Button { focusable: true; text: "−10"; onClicked: root.run(["action", "back"]) }
           Button { focusable: true; text: root.playing ? "󰏤" : "󰐊"; onClicked: root.run(["action", "pause"]) }
           Button { focusable: true; text: "+10"; onClicked: root.run(["action", "forward"]) }
+          Button { focusable: true; enabled: root.queueCount > 1; text: "󰒭"; onClicked: root.run(["action", "next"]) }
           Button { focusable: true; text: "−"; onClicked: root.run(["action", "volume-down"]) }
           Button { focusable: true; text: "+"; onClicked: root.run(["action", "volume-up"]) }
-          Button { focusable: true; text: root.words("Ampliar", "Fullscreen"); onClicked: root.run(["action", "fullscreen"]) }
+          Button { focusable: true; text: root.words("Ampliar", "Fullscreen"); visible: !root.audioOnly; onClicked: root.run(["action", "fullscreen"]) }
           Button { focusable: true; text: root.words("Detener", "Stop"); onClicked: root.run(["action", "stop"]) }
         }
         Row {
@@ -322,8 +459,9 @@ BarWidget {
           width: parent.width
           spacing: Style.space(6)
           Rectangle {
+            id: progressTrack
             width: parent.width - timeLabel.width - Style.space(6)
-            height: Style.space(3)
+            height: Style.space(4)
             anchors.verticalCenter: parent.verticalCenter
             radius: height / 2
             color: Qt.darker(root.foreground, 2.3)
@@ -332,6 +470,14 @@ BarWidget {
               height: parent.height
               radius: height / 2
               color: Color.accent
+            }
+            MouseArea {
+              anchors.fill: parent
+              anchors.topMargin: -Style.space(8)
+              anchors.bottomMargin: -Style.space(8)
+              enabled: root.durationSeconds > 0
+              cursorShape: Qt.PointingHandCursor
+              onClicked: function(mouse) { root.seekTo((mouse.x / progressTrack.width) * root.durationSeconds) }
             }
           }
           Text {
@@ -370,6 +516,7 @@ BarWidget {
         model: root.results
         delegate: Row {
           required property var modelData
+          required property int index
           width: resultList.width
           height: Style.space(52)
           spacing: Style.space(8)
@@ -391,7 +538,7 @@ BarWidget {
             tooltipText: (modelData.duration ? modelData.duration + "  ·  " : "") + modelData.title
             leftAlign: true
             focusable: true
-            onClicked: root.playUrl(modelData.url)
+            onClicked: root.playResults(index)
           }
         }
       }
