@@ -53,6 +53,12 @@ PLAYER_X = _env_int("OMARCHY_YOUTUBE_X", 24, 0, 20000)
 PLAYER_Y = _env_int("OMARCHY_YOUTUBE_Y", 64, 0, 20000)
 # 0 means "leave the cache size to the user's mpv.conf".
 PLAYER_CACHE_MB = _env_int("OMARCHY_YOUTUBE_CACHE_MB", 0, 0, 4096)
+# YouTube's default extractor client frequently triggers "Sign in to confirm
+# you're not a bot" (and HTTP 429) for yt-dlp. When that happens mpv cannot open
+# the stream, goes idle, and playback stops right after it appears to start. The
+# android client avoids that check. Override with OMARCHY_YOUTUBE_PLAYER_CLIENT,
+# or set it to an empty string to fall back to yt-dlp's default client.
+PLAYER_CLIENT = os.environ.get("OMARCHY_YOUTUBE_PLAYER_CLIENT", "android").strip()
 VIDEO_FORMAT = "bestvideo[height<=720]+bestaudio/best[height<=720]"
 AUDIO_FORMAT = "bestaudio/best"
 
@@ -372,6 +378,18 @@ def _raw_get_property(name: str) -> object:
         return None
 
 
+def _await_loaded(timeout: float = 3.0) -> bool:
+    # True once the player has a file loaded (no longer idle). Used to detect a
+    # loadfile that did not take, so it can be retried instead of leaving the
+    # player silently empty.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _raw_get_property("idle-active") is False:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def _player_pids() -> list[int]:
     """PIDs of mpv processes that own this plugin's IPC socket."""
     marker = str(SOCKET_PATH).encode("utf-8")
@@ -436,12 +454,15 @@ def ensure_player() -> None:
     alive = socket_is_alive()
     if alive:
         running_windowed = _running_windowed()
-        if running_windowed == desired_windowed:
-            if desired_windowed:
+        if running_windowed is None or running_windowed == desired_windowed:
+            # Never tear down a live player just because its mode could not be
+            # read: the property query can time out while mpv is starting up or
+            # resolving a stream, and relaunching here would discard the track
+            # that was just loaded into it.
+            if running_windowed is not None and desired_windowed:
                 normalize_window(active_window_address())
             return
-        # Audio and video need different players (windowed vs headless), so tear
-        # the current one down and relaunch it below.
+        # The live player is genuinely in the wrong mode, so replace it below.
         _stop_player()
     elif _player_pids():
         # An mpv is still running but its socket is unreachable; clear it first so
@@ -489,6 +510,8 @@ def ensure_player() -> None:
         ]
     if PLAYER_CACHE_MB > 0:
         command.append("--demuxer-max-bytes=" + f"{PLAYER_CACHE_MB}MiB")
+    if PLAYER_CLIENT:
+        command.append("--ytdl-raw-options=extractor-args=youtube:player_client=" + PLAYER_CLIENT)
     subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -550,12 +573,21 @@ def get_property(name: str) -> object:
         return None
 
 
+def _ytdl_client_args() -> list[str]:
+    # Same rationale as PLAYER_CLIENT: pick an extractor client that avoids
+    # YouTube's "confirm you're not a bot" / HTTP 429 responses.
+    if not PLAYER_CLIENT:
+        return []
+    return ["--extractor-args", "youtube:player_client=" + PLAYER_CLIENT]
+
+
 def metadata_for(url: str) -> dict:
     # Ask yt-dlp for only the fields we use. A full --dump-single-json payload is
     # hundreds of KiB per video (every format/storyboard), which overruns the
     # bounded-process limit; field selection keeps it to a few hundred bytes.
     command = [
         "yt-dlp",
+        *_ytdl_client_args(),
         "--flat-playlist",
         "--skip-download",
         "--no-warnings",
@@ -590,6 +622,7 @@ def search(query: str, lang: str) -> dict:
     fetch_count = MAX_RESULTS + 5
     command = [
         "yt-dlp",
+        *_ytdl_client_args(),
         "--flat-playlist",
         "--dump-single-json",
         "--playlist-end",
@@ -653,22 +686,30 @@ def _play_queue(items: list, index: int, lang: str, audio_only: bool | None = No
     previous_state = read_state()
     restore_address = active_window_address() if not audio_only else ""
     try:
-        ipc(["set_property", "ytdl-format", AUDIO_FORMAT if audio_only else VIDEO_FORMAT])
-        ipc(["stop"])
+        # Launch/select a player exactly once, then talk to it directly. Calling
+        # ipc() per command would re-run mode detection and could relaunch mpv
+        # mid-sequence, discarding the track that was just loaded (which made
+        # playback stop right after it started).
+        ensure_player()
+        _send_ipc(["set_property", "ytdl-format", AUDIO_FORMAT if audio_only else VIDEO_FORMAT])
         for position, item in enumerate(ordered):
-            ipc(["loadfile", item["url"], "replace" if position == 0 else "append"])
-        ipc(["set_property", "pause", False])
+            _send_ipc(["loadfile", item["url"], "replace" if position == 0 else "append"])
+        _send_ipc(["set_property", "pause", False])
         current = ordered[0]
-        ipc(["set_property", "force-media-title", current["title"]])
+        _send_ipc(["set_property", "force-media-title", current["title"]])
         if audio_only:
             # Headless player: there is no window to manage.
-            ipc(["set_property", "vid", "no"])
+            _send_ipc(["set_property", "vid", "no"])
         else:
-            ipc(["set_property", "vid", "auto"])
-            ipc(["set_property", "window-minimized", False])
+            _send_ipc(["set_property", "vid", "auto"])
+            _send_ipc(["set_property", "window-minimized", False])
             if previous_state.get("audioOnly") and previous_state.get("workspace"):
                 move_player_to_workspace(previous_state.get("workspace", ""))
             normalize_window(restore_address)
+        if not _await_loaded():
+            # The first loadfile occasionally does not take; retry it so the
+            # track cannot end up silently unloaded (idle) in the player.
+            _send_ipc(["loadfile", ordered[0]["url"], "replace"])
         write_state({
             "url": current["url"],
             "title": current["title"],
